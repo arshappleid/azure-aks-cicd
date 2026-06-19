@@ -1,0 +1,42 @@
+name: Convert README to PDF
+
+on:
+    push:
+        paths:
+            - README.md
+env:
+    AWS_REGION: us-east-1
+    GITHUB_ACTION_IAM_ROLE: arn:aws:iam::793324447082:role/GithubAutomationForWebSiteDocs
+    S3_BUCKET_NAME: cloudcompliant-website-docs
+    FILE_NAME: FileName-Without-Extension
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repo
+              uses: actions/checkout@v4
+
+            - name: Install pandoc
+              run: sudo apt-get install pandoc -y
+
+            - name: Install LaTeX
+              run: sudo apt-get install texlive-latex-base texlive-fonts-recommended texlive-latex-extra -y
+
+            - name: Convert README to PDF
+              run: pandoc README.md -o README.pdf
+
+            - name: Configure AWS credentials via OIDC
+              uses: aws-actions/configure-aws-credentials@v1
+              with:
+                  role-to-assume: ${{ env.GITHUB_ACTION_IAM_ROLE }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Upload PDF to S3
+              run: |
+                  aws s3 cp README.pdf s3://${{ env.S3_BUCKET_NAME }}/Work/${{ env.FILE_NAME }}.pdf
