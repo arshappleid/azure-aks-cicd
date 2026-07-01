@@ -1,0 +1,6 @@
+environment:
+  name: dev
+  variables:
+    - name: baseUrl
+      value: http://prab-cicd-api-alb-1337318245.us-east-1.elb.amazonaws.com
+      enabled: true

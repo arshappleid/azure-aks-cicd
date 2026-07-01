@@ -1,0 +1,274 @@
+# Azure DevOps Pipeline
+# Name: Deploy Backend Service to Azure AKS
+# Similar to the original GitHub Actions pipeline but modified to deploy to Azure (ACR & AKS) instead of AWS.
+
+trigger:
+  branches:
+    include:
+      - stage
+      - prod
+      - dev
+  paths:
+    include:
+      - app/backend/**
+      - k8s/**
+
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Global pipeline variables
+  REPO_ROOT_FOLDER_NAME: 'app/backend'
+  UNIT_TEST_PATH: 'tests/unit'
+  API_TESTS_PATH: 'app/backend/tests/api'
+  API_BASE_URL: 'http://prab-aks-backend-service' # User can update this to the LoadBalancer IP/DNS of the AKS Service
+  JFROG_PYPI_REPO: 'prab-eks-pypi'
+  JFROG_REPORTS_REPO: 'prab-eks-reports'
+  
+  # Azure Resource Manager Connection and Resource Configuration
+  # Note: Create an Azure Resource Manager Service Connection named 'azure-service-connection' in Azure DevOps.
+  AZURE_SERVICE_CONNECTION: 'azure-service-connection'
+  AZURE_RESOURCE_GROUP: 'prab-aks-rg'
+  
+  # ACR and AKS configs (dynamically uses environment based on branch)
+  ACR_NAME: 'prabacr'
+  ACR_REGISTRY: '$(ACR_NAME).azurecr.io'
+  ACR_REPOSITORY_NAME: 'backend'
+  AKS_CLUSTER_NAME: 'prab-aks-cluster-$(Build.SourceBranchName)'
+
+jobs:
+  # --------------------------------------------------------
+  # JOB 1: Build Source Code
+  # --------------------------------------------------------
+  - job: build
+    displayName: 'Build Source Code'
+    timeoutInMinutes: 10
+    steps:
+      - checkout: self
+
+      - task: AzureCLI@2
+        displayName: 'Login to Azure Container Registry'
+        inputs:
+          azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            az acr login --name $(ACR_NAME)
+
+      - script: |
+          docker build --platform linux/amd64 \
+              -t $(ACR_REGISTRY)/$(ACR_REPOSITORY_NAME):$(Build.SourceVersion) \
+              -t $(ACR_REGISTRY)/$(ACR_REPOSITORY_NAME):latest \
+              -f $(REPO_ROOT_FOLDER_NAME)/Dockerfile \
+              $(REPO_ROOT_FOLDER_NAME)
+          docker push $(ACR_REGISTRY)/$(ACR_REPOSITORY_NAME):$(Build.SourceVersion)
+          docker push $(ACR_REGISTRY)/$(ACR_REPOSITORY_NAME):latest
+          
+          # Set output variable for subsequent jobs
+          echo "##vso[task.setvariable variable=image;isOutput=true]$(ACR_REGISTRY)/$(ACR_REPOSITORY_NAME):$(Build.SourceVersion)"
+        name: build_image
+        displayName: 'Build and push ECR image'
+
+  # --------------------------------------------------------
+  # JOB 2: Unit Testing
+  # --------------------------------------------------------
+  - job: unit_test
+    displayName: 'Unit Testing'
+    dependsOn: build
+    timeoutInMinutes: 10
+    variables:
+      image: $[ dependencies.build.outputs['build_image.image'] ]
+    steps:
+      - checkout: self
+
+      - task: AzureCLI@2
+        displayName: 'Login to ACR and Pull Image'
+        inputs:
+          azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            az acr login --name $(ACR_NAME)
+            docker pull $(image)
+
+      - script: |
+          # Use Trivy container to run the scanner
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.50.0 image \
+            --format table \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH \
+            $(image)
+        displayName: 'Run Trivy Vulnerability Scanner'
+
+      - script: |
+          docker run -d \
+            --name backend-test \
+            --entrypoint "" \
+            $(image) \
+            tail -f /dev/null
+        displayName: 'Start container'
+
+      - script: |
+          docker exec backend-test pytest $(UNIT_TEST_PATH) -v --junitxml=/tmp/junit-report.xml
+        displayName: 'Run pytest and Generate Report'
+
+      - script: |
+          # Copy report from container to host
+          docker cp backend-test:/tmp/junit-report.xml ./junit-report.xml
+          # Install JFrog CLI
+          curl -fL https://install-cli.jfrog.io | sh
+          # Upload
+          jf rt upload "junit-report.xml" "$(JFROG_REPORTS_REPO)/backend-reports/$(Build.BuildId)/junit-report.xml"
+        displayName: 'Upload Unit Test Report to JFrog'
+        condition: always()
+        env:
+          JF_URL: 'https://pdeol.jfrog.io/'
+          JF_ACCESS_TOKEN: $(JF_ACCESS_TOKEN)
+
+      - task: PublishTestResults@2
+        displayName: 'Publish Unit Test Results'
+        condition: always()
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '**/junit-report.xml'
+          testRunTitle: 'Unit Tests'
+
+      - script: |
+          docker rm -f backend-test
+        displayName: 'Stop container'
+        condition: always()
+
+  # --------------------------------------------------------
+  # JOB 3: Static Application Security Testing (SAST)
+  # --------------------------------------------------------
+  - job: static_scan
+    displayName: 'Static Application Security Testing (SAST)'
+    dependsOn: unit_test
+    steps:
+      - checkout: self
+
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.x'
+        displayName: 'Use Python 3.x'
+
+      - script: |
+          curl -fL https://install-cli.jfrog.io | sh
+          jf pip-config --repo-resolve $(JFROG_PYPI_REPO)
+          jf pip install semgrep
+        displayName: 'Install Semgrep using JFrog'
+        env:
+          JF_URL: 'https://pdeol.jfrog.io/'
+          JF_ACCESS_TOKEN: $(JF_ACCESS_TOKEN)
+
+      - script: |
+          semgrep scan --config p/security-audit --junit-xml -o semgrep-report.xml || true
+        displayName: 'Run Semgrep SAST and Generate Report'
+
+      - script: |
+          curl -fL https://install-cli.jfrog.io | sh
+          jf rt upload "semgrep-report.xml" "$(JFROG_REPORTS_REPO)/backend-reports/$(Build.BuildId)/semgrep-report.xml"
+        displayName: 'Upload SAST Report to JFrog'
+        condition: always()
+        env:
+          JF_URL: 'https://pdeol.jfrog.io/'
+          JF_ACCESS_TOKEN: $(JF_ACCESS_TOKEN)
+
+      - task: PublishTestResults@2
+        displayName: 'Publish Semgrep SAST Results'
+        condition: always()
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '**/semgrep-report.xml'
+          testRunTitle: 'Semgrep SAST'
+
+      - script: |
+          semgrep scan --config p/security-audit --error
+        displayName: 'Enforce SAST Failure'
+
+  # --------------------------------------------------------
+  # JOB 4: Deploy Backend Service to Azure AKS
+  # --------------------------------------------------------
+  - deployment: deploy
+    displayName: 'Deploy Backend Service to AKS'
+    dependsOn: static_scan
+    timeoutInMinutes: 10
+    environment: '$(Build.SourceBranchName)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            # Native Azure DevOps task to connect to AKS and deploy Kubernetes manifests.
+            # This handles replacing image placeholders in manifests automatically.
+            - task: KubernetesManifest@1
+              displayName: 'Deploy to AKS Cluster'
+              inputs:
+                action: 'deploy'
+                connectionType: 'azureResourceManager'
+                azureSubscriptionConnection: '$(AZURE_SERVICE_CONNECTION)'
+                azureResourceGroup: '$(AZURE_RESOURCE_GROUP)'
+                kubernetesCluster: '$(AKS_CLUSTER_NAME)'
+                namespace: 'default'
+                manifests: |
+                  k8s/deployment.yaml
+                  k8s/service.yaml
+                containers: |
+                  $(ACR_REGISTRY)/$(ACR_REPOSITORY_NAME):$(Build.SourceVersion)
+
+            # Verification step using kubectl via Kubernetes task
+            - task: Kubernetes@1
+              displayName: 'Verify Deployment and Service Status'
+              inputs:
+                connectionType: 'azureResourceManager'
+                azureSubscriptionEndpoint: '$(AZURE_SERVICE_CONNECTION)'
+                azureResourceGroup: '$(AZURE_RESOURCE_GROUP)'
+                kubernetesCluster: '$(AKS_CLUSTER_NAME)'
+                command: 'get'
+                arguments: 'deployment backend -o wide'
+
+            - task: Kubernetes@1
+              displayName: 'Verify Service External IP'
+              inputs:
+                connectionType: 'azureResourceManager'
+                azureSubscriptionEndpoint: '$(AZURE_SERVICE_CONNECTION)'
+                azureResourceGroup: '$(AZURE_RESOURCE_GROUP)'
+                kubernetesCluster: '$(AKS_CLUSTER_NAME)'
+                command: 'get'
+                arguments: 'service backend'
+
+  # --------------------------------------------------------
+  # JOB 5: API Testing
+  # --------------------------------------------------------
+  - job: api_test
+    displayName: 'API Testing'
+    dependsOn: deploy
+    timeoutInMinutes: 15
+    steps:
+      - checkout: self
+
+      # Migrated from deprecated NodeTool@0 to UseNode@1
+      - task: UseNode@1
+        inputs:
+          version: '24.x'
+        displayName: 'Set up Node.js 24'
+
+      - script: |
+          npm install -g @usebruno/cli@3
+        displayName: 'Install Bruno CLI'
+
+      - script: |
+          bru run \
+            --env $(Build.SourceBranchName) \
+            --env-var baseUrl="$(API_BASE_URL)" \
+            --env-var platform_name="Azure DevOps" \
+            --env-var build_id="$(Build.BuildId)" \
+            --env-var commit_sha="$(Build.SourceVersion)"
+        workingDirectory: '$(API_TESTS_PATH)'
+        displayName: 'Run Bruno demo collection'

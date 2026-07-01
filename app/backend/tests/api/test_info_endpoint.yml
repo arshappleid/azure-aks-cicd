@@ -1,0 +1,17 @@
+meta:
+  name: GET /info returns 200 and healthy status
+  type: http
+  seq: 1
+http:
+  method: GET
+  url: "{{BASE_URL}}/info"
+  body:
+    type: none
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.message
+      operator: eq
+      value: "Prabhmeets Server"
